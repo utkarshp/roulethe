@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0
 pragma solidity ^0.8.23;
 
-contract Roulethe {
-    uint256 private constant MAX_PAYOUT = 0.1 ether;
-    uint8 private constant CASHOUT_REWARD_FACTOR = 5;
+contract Rouleth {
+    uint8 private constant CASHOUT_REWARD_PERCENT = 5;
     
     uint8 private constant RESULT_MAX = 38;
     uint8 private constant SPIN_BLOCK_DIFF = 4;
@@ -24,12 +23,13 @@ contract Roulethe {
     uint256 private constant HALF_MULT = 2;
     uint256 private constant PARITY_MULT = 2;
 
-    uint8[2][18] private COLORED_NUMBERS;
+    uint8[18][2] private COLORED_NUMBERS;
 
     bool openForBets;
     bool spinning;
     uint256 thisRoundAmount;
     uint256 spinBlockNum;
+    uint256 private singleBetMaxPayout;
     
     address public house;
     address[] public bettors;
@@ -41,13 +41,15 @@ contract Roulethe {
     mapping(address => bytes32) private commits;
     
     event Bet(address from, uint betmask);
+    event Log(string message, uint256 value);
 
     constructor() {
 	house = msg.sender;
 	openForBets = true;
 	spinning = false;
 	thisRoundAmount = 0;
-	
+	singleBetMaxPayout = 0.1 ether;
+
 	uint8[18] memory RED_NUMBERS = [
             1, 3, 5, 7, 9, 12, 14, 16, 18, 19, 21, 23, 25, 27, 30, 32, 34, 36
         ];
@@ -57,7 +59,7 @@ contract Roulethe {
         ];
 
         for (uint8 i = 0; i < 18; i++) {
-            COLORED_NUMBERS[0][i] = RED_NUMBERS[i];  
+            COLORED_NUMBERS[0][i] = RED_NUMBERS[i];
             COLORED_NUMBERS[1][i] = BLACK_NUMBERS[i];
         }
 	
@@ -68,23 +70,31 @@ contract Roulethe {
 	_;
     }
 
-    function transferTo(uint256 amount, address payable _to) public onlyHouse {
+    receive() external payable {}
+
+    function transferAmountTo(uint256 amount, address payable _to) public onlyHouse {
 	require(address(this).balance >= amount, "Insufficient funds");
 	_to.transfer(amount);
-	require(spinnable(), "Transfer would make payouts impossible.");
+	require(spinnable(), "Transfer would make payouts impossible");
     }
 
     function setBettingState(bool bettingAllowed) public onlyHouse {
 	openForBets = bettingAllowed;
     }
 
-    function decodeBet(uint256 bet, uint8 shift) internal pure returns (uint256 betval, uint256 amount) {
+    function setPayoutLimit(uint256 newLimit) public onlyHouse {
+	singleBetMaxPayout = newLimit;
+    }
+
+    function decodeBet(uint256 bet, uint8 shift) internal pure returns (uint256 betval,
+									uint256 amount) {
 	uint256 betAmount = (bet >> shift) & BET_AMOUNT_MASK;
 	betval = (betAmount >> AMOUNT_SHIFT);
 	amount = (betAmount & AMOUNT_MASK) * 1 gwei;
     }
 
-    function encodeBet(uint256 val, uint256 amount, uint8 shift) internal pure returns (uint256 bet) {
+    function encodeBet(uint256 val, uint256 amount, uint8 shift)
+	internal pure returns (uint256 bet) {
 	return ((val << AMOUNT_SHIFT) | (amount / 1 gwei)) << shift;
     }
 
@@ -104,7 +114,8 @@ contract Roulethe {
 	return encodeBet(halfBet, amount, HALF_SHIFT);
     }
     
-    function encodeParityBet(uint256 parityBet, uint256 amount) public pure returns (uint256 bet) {
+    function encodeParityBet(uint256 parityBet, uint256 amount) public pure returns (uint256 bet)
+    {
 	return encodeBet(parityBet, amount, PARITY_SHIFT);
     }
 
@@ -122,14 +133,14 @@ contract Roulethe {
 
     function spinnable() public view returns (bool) {
 	uint256 maxPayout = 0;
-
+ 
 	for (uint256 i=1; i<=RESULT_MAX; i++) {
 	    if (potentialPayouts[i] > maxPayout) {
 		maxPayout = potentialPayouts[i];
 	    }
 	}
-
-	return maxPayout + (thisRoundAmount - maxPayout) * CASHOUT_REWARD_FACTOR / 100 <= address(this).balance;
+	
+	return maxPayout * (1 + CASHOUT_REWARD_PERCENT / 100) <= address(this).balance;
     }
 
     function spin() public {
@@ -144,14 +155,18 @@ contract Roulethe {
     function cashout(uint256 secret, string memory salt) public {
 	require(spinning, "Not spinning");
 	require(block.number > spinBlockNum + SPIN_BLOCK_DIFF, "Spin too recent");
-	require(keccak256(abi.encodePacked(secret, salt)) == commits[msg.sender], "Invalid reveal");
+
+	// TODO: Explore enforcing more than one commits and a quorum requirement
+	// for a successful cashout.
+	require(keccak256(abi.encodePacked(secret, salt)) == commits[msg.sender],
+		"Invalid reveal");
 
 	uint8 outcome = uint8(determineOutcome(secret));
-	uint256 houseEarnings = redistributeBalances(outcome);
+	uint256 payouts = redistributeBalances(outcome);
 	readyForNextRound();
 	
 	// Pay the caller the cashout reward.
-	payable(msg.sender).transfer(houseEarnings * CASHOUT_REWARD_FACTOR);
+	payable(msg.sender).transfer(payouts * CASHOUT_REWARD_PERCENT / 100);
     }
 
     function readyForNextRound() internal {
@@ -232,7 +247,7 @@ contract Roulethe {
     }
 
     function placeBet(uint256 bet, bytes32 commitHash) public payable {
-	require(openForBets);
+	require(openForBets, "Not open for bets");
 
 	uint256 totalBetAmount = 0;
 
@@ -241,17 +256,17 @@ contract Roulethe {
 	if (numberBetAmount > 0) {
 	    require(numberBet >= 1 && numberBet <= RESULT_MAX, "Invalid number bet");
 	    uint payout = numberBetAmount * NUMBER_MULT;
-	    require(payout <= MAX_PAYOUT, "Number bet payout exceeds current limit");
+	    require(payout <= singleBetMaxPayout, "Number bet payout exceeds current limit");
 	    potentialPayouts[numberBet] += payout;
 	    totalBetAmount += numberBetAmount;
 	}
 	
 	// Decode dozen bet
-	(uint256 dozenBetAmount, uint256 dozenBet)  = decodeBet(bet, DOZEN_SHIFT);
+	(uint256 dozenBet, uint256 dozenBetAmount)  = decodeBet(bet, DOZEN_SHIFT);
 	if (dozenBetAmount > 0) {
 	    require(dozenBet >=1 && dozenBet <= 3, "Invalid dozen bet");
 	    uint payout = dozenBetAmount * DOZEN_MULT;
-	    require(payout <= MAX_PAYOUT, "Dozen bet payout exceeds current limit");
+	    require(payout <= singleBetMaxPayout, "Dozen bet payout exceeds current limit");
 	    for (uint256 i=(dozenBet-1)*12+1; i<=dozenBet*12; i++) {
 		potentialPayouts[i] += payout;
 	    }
@@ -259,11 +274,12 @@ contract Roulethe {
 	}
 
 	// Decode color bet
-	(uint256 colorBetAmount, uint256 colorBet) = decodeBet(bet, COLOR_SHIFT);
+	(uint256 colorBet, uint256 colorBetAmount) = decodeBet(bet, COLOR_SHIFT);
 	if (colorBetAmount > 0) {
-	    require(colorBet == 1 || colorBet == 2, "Invalid color bet");  // 1 for red, 2 for black.
+	    // 1 for red, 2 for black.
+	    require(colorBet == 1 || colorBet == 2, "Invalid color bet");  
 	    uint payout = colorBetAmount * COLOR_MULT;
-	    require(payout <= MAX_PAYOUT, "Color bet payout exceeds current limit");
+	    require(payout <= singleBetMaxPayout, "Color bet payout exceeds current limit");
 	    for (uint256 i=0; i<18; i++) {
 		potentialPayouts[COLORED_NUMBERS[(colorBet-1)][i]] += payout;
 	    }
@@ -271,11 +287,11 @@ contract Roulethe {
 	}
 
 	// Decode half bet
-	(uint256 halfBetAmount, uint256 halfBet) = decodeBet(bet, HALF_SHIFT);
+	(uint256 halfBet, uint256 halfBetAmount) = decodeBet(bet, HALF_SHIFT);
 	if (halfBetAmount > 0) {
 	    require(halfBet==1 || halfBet==2, "Invalid half bet");
 	    uint payout = halfBetAmount * HALF_MULT;
-	    require(payout <= MAX_PAYOUT, "Half bet payout exceeds current limit");
+	    require(payout <= singleBetMaxPayout, "Half bet payout exceeds current limit");
 	    for (uint256 i=(halfBet-1)*18+1; i<=halfBet*18; i++) {
 		potentialPayouts[i] += payout;
 	    }
@@ -283,11 +299,12 @@ contract Roulethe {
 	}
 
 	// Decode parity bet
-	(uint256 parityBetAmount, uint256 parityBet) = decodeBet(bet, PARITY_SHIFT);
+	(uint256 parityBet, uint256 parityBetAmount) = decodeBet(bet, PARITY_SHIFT);
 	if (parityBetAmount > 0) {
-	    require(parityBet==1 || parityBet==2, "Invalid parity bet"); // 1 for odd, 2 for even.
+	    // 1 for odd, 2 for even.
+	    require(parityBet==1 || parityBet==2, "Invalid parity bet"); 
 	    uint payout = parityBetAmount * PARITY_MULT;
-	    require(payout <= MAX_PAYOUT, "Parity bet payout exceeds current limit");
+	    require(payout <= singleBetMaxPayout, "Parity bet payout exceeds current limit");
 	    for (uint256 i=0; i<=17; i++) {
 		potentialPayouts[2*i+parityBet] += payout;
 	    }
@@ -299,18 +316,20 @@ contract Roulethe {
 	    uint256 alreadyPresent = userBetAmounts[msg.sender];
 	    if (totalBetAmount < alreadyPresent) {
 		uint256 amountToSend = alreadyPresent - totalBetAmount;
-		require(address(this).balance >= amountToSend, "Contract does not have enough funds to refund"); // This should never happen.
+		// This should never happen.
+		require(address(this).balance >= amountToSend,
+			"Contract does not have enough funds to refund"); 
 		userBetAmounts[msg.sender] = msg.value;	
 		payable(msg.sender).transfer(amountToSend);
 	    }
 	    else {
 		uint256 needAmount = totalBetAmount - alreadyPresent;
-		require(msg.value >= needAmount);
+		require(msg.value >= needAmount, "Sent ETH insufficient to cover the bet");
 		userBetAmounts[msg.sender] = msg.value;	
 	    }
 	}
 	else {
-	    require(msg.value == totalBetAmount, "Sent ETH must match the total bet amount");
+	    require(msg.value >= totalBetAmount, "Sent ETH must match the total bet amount");
 	    bettors.push(msg.sender);
 	    userBetAmounts[msg.sender] = msg.value;
 	}
